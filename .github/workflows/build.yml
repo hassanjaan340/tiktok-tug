@@ -1,0 +1,391 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create project files
+        run: |
+          mkdir -p tt/app/src/main/java/com/bilal/tiktoktug
+          cd tt
+          cat > settings.gradle.kts <<'EOF_X'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "TikTokTug"
+          include(":app")
+          EOF_X
+          cat > build.gradle.kts <<'EOF_X'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_X
+          cat > gradle.properties <<'EOF_X'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_X
+          cat > app/build.gradle.kts <<'EOF_X'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.bilal.tiktoktug"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.bilal.tiktoktug"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+          }
+          EOF_X
+          cat > app/src/main/AndroidManifest.xml <<'EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="TikTok Tug of War"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_X
+          cat > app/src/main/java/com/bilal/tiktoktug/Net.kt <<'EOF_X'
+          package com.bilal.tiktoktug
+
+          import okhttp3.*
+          import org.json.JSONObject
+          import java.net.URLEncoder
+          import java.util.concurrent.TimeUnit
+
+          class Net(
+              private val onEvent: (JSONObject) -> Unit,
+              private val onStatus: (Boolean, String) -> Unit
+          ) {
+              private val client = OkHttpClient.Builder().pingInterval(20, TimeUnit.SECONDS).build()
+              private var ws: WebSocket? = null
+
+              fun connect(server: String, user: String) {
+                  disconnect()
+                  var url = server.trim()
+                  if (user.isNotBlank()) {
+                      url += (if (url.contains("?")) "&" else "?") +
+                          "user=" + URLEncoder.encode(user.trim().removePrefix("@"), "UTF-8")
+                  }
+                  val req = try {
+                      Request.Builder().url(url).build()
+                  } catch (e: Exception) {
+                      onStatus(false, "Bad server URL"); return
+                  }
+                  ws = client.newWebSocket(req, object : WebSocketListener() {
+                      override fun onOpen(webSocket: WebSocket, response: Response) {
+                          onStatus(true, "Bridge connected")
+                      }
+                      override fun onMessage(webSocket: WebSocket, text: String) {
+                          try { onEvent(JSONObject(text)) } catch (_: Exception) {}
+                      }
+                      override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                          onStatus(false, "Disconnected")
+                      }
+                      override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                          onStatus(false, "Error: " + (t.message ?: "connection failed"))
+                      }
+                  })
+              }
+
+              fun disconnect() {
+                  ws?.close(1000, null)
+                  ws = null
+              }
+          }
+          EOF_X
+          cat > app/src/main/java/com/bilal/tiktoktug/GameView.kt <<'EOF_X'
+          package com.bilal.tiktoktug
+
+          import android.content.Context
+          import android.graphics.*
+          import android.view.View
+          import org.json.JSONObject
+          import kotlin.math.abs
+
+          class GameView(context: Context) : View(context) {
+
+              companion object {
+                  const val LIKE_POWER = 0.0015f   // per like
+                  const val GIFT_POWER = 0.006f    // per diamond
+                  const val RESET_MS = 6000L
+              }
+
+              var connected = false
+              var statusText = "Not connected"
+
+              private var rope = 0f                       // +1 team1 wins, -1 team2 wins
+              private val members = HashMap<String, Int>()
+              private val teamCount = intArrayOf(0, 0, 0)
+              private val topName = arrayOf("", "-", "-")
+              private val topVal = intArrayOf(0, 0, 0)
+              private var winner = 0
+              private var resetAt = 0L
+              private val feed = ArrayDeque<String>()
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              fun log(s: String) {
+                  feed.addFirst(s)
+                  while (feed.size > 8) feed.removeLast()
+              }
+
+              fun handle(d: JSONObject) {
+                  val user = d.optString("user", "?")
+                  when (d.optString("type")) {
+                      "status" -> log(d.optString("msg"))
+                      "chat" -> {
+                          val c = d.optString("comment").trim()
+                          if ((c == "1" || c == "2") && !members.containsKey(user)) {
+                              val t = c.toInt()
+                              members[user] = t
+                              teamCount[t]++
+                              log("$user joined team $t")
+                          }
+                      }
+                      "like" -> pull(user, d.optInt("count", 1) * LIKE_POWER)
+                      "gift" -> {
+                          val dia = d.optInt("diamonds", 1)
+                          pull(user, dia * GIFT_POWER)
+                          val t = members[user] ?: 0
+                          if (t != 0 && dia > topVal[t]) { topVal[t] = dia; topName[t] = user }
+                          log("$user sent ${d.optString("gift", "gift")} ($dia)")
+                      }
+                  }
+                  postInvalidate()
+              }
+
+              private fun pull(user: String, amount: Float) {
+                  if (winner != 0) return
+                  val t = members[user] ?: return        // must join a team first
+                  rope += if (t == 1) amount else -amount
+                  rope = rope.coerceIn(-1f, 1f)
+                  if (abs(rope) >= 1f) {
+                      winner = if (rope > 0) 1 else 2
+                      resetAt = System.currentTimeMillis() + RESET_MS
+                  }
+              }
+
+              private fun resetGame() {
+                  rope = 0f; winner = 0
+                  members.clear()
+                  teamCount.fill(0)
+                  topName[1] = "-"; topName[2] = "-"
+                  topVal.fill(0)
+              }
+
+              private fun text(c: Canvas, s: String, x: Float, y: Float, size: Float, color: Int, align: Paint.Align) {
+                  p.color = color; p.textSize = size; p.textAlign = align
+                  p.typeface = Typeface.DEFAULT_BOLD
+                  c.drawText(s, x, y, p)
+              }
+
+              override fun onDraw(c: Canvas) {
+                  if (winner != 0 && System.currentTimeMillis() >= resetAt) resetGame()
+                  val w = width.toFloat(); val h = height.toFloat()
+                  val s = w / 1080f
+                  val red = Color.parseColor("#ef4444"); val blue = Color.parseColor("#3b82f6")
+
+                  c.drawColor(Color.parseColor("#0f172a"))
+                  text(c, statusText, 24 * s, 48 * s, 30 * s, if (connected) Color.GREEN else Color.parseColor("#f87171"), Paint.Align.LEFT)
+                  text(c, "TUG OF WAR", w / 2, h * 0.10f, 100 * s, Color.WHITE, Paint.Align.CENTER)
+                  text(c, "Comment 1 or 2 to join. Like & Gift to pull!", w / 2, h * 0.10f + 60 * s, 36 * s, Color.parseColor("#94a3b8"), Paint.Align.CENTER)
+
+                  val ty = h * 0.22f
+                  text(c, "TEAM 1", 50 * s, ty, 72 * s, red, Paint.Align.LEFT)
+                  text(c, "${teamCount[1]} players", 50 * s, ty + 50 * s, 38 * s, Color.WHITE, Paint.Align.LEFT)
+                  text(c, "Top: ${topName[1]} (${topVal[1]})", 50 * s, ty + 95 * s, 32 * s, Color.parseColor("#fca5a5"), Paint.Align.LEFT)
+                  text(c, "TEAM 2", w - 50 * s, ty, 72 * s, blue, Paint.Align.RIGHT)
+                  text(c, "${teamCount[2]} players", w - 50 * s, ty + 50 * s, 38 * s, Color.WHITE, Paint.Align.RIGHT)
+                  text(c, "Top: ${topName[2]} (${topVal[2]})", w - 50 * s, ty + 95 * s, 32 * s, Color.parseColor("#93c5fd"), Paint.Align.RIGHT)
+
+                  // rope
+                  val y = h * 0.45f
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = 16 * s; p.color = Color.parseColor("#a16207")
+                  c.drawLine(80 * s, y, w - 80 * s, y, p)
+                  p.strokeWidth = 4 * s; p.color = Color.WHITE
+                  c.drawLine(w / 2, y - 90 * s, w / 2, y + 90 * s, p)
+                  p.style = Paint.Style.FILL
+                  p.color = red; c.drawRect(30 * s, y - 120 * s, 70 * s, y + 120 * s, p)
+                  p.color = blue; c.drawRect(w - 70 * s, y - 120 * s, w - 30 * s, y + 120 * s, p)
+                  // team 1 (red, left) pulls the knot to the left; team 2 (blue, right) to the right
+                  p.color = Color.parseColor("#fbbf24")
+                  c.drawCircle(w / 2 - rope * (w / 2 - 120 * s), y, 48 * s, p)
+
+                  if (winner != 0) {
+                      text(c, "TEAM $winner WINS!", w / 2, h * 0.58f, 110 * s, if (winner == 1) red else blue, Paint.Align.CENTER)
+                  }
+                  for ((i, line) in feed.withIndex()) {
+                      text(c, line, 30 * s, h * 0.65f + i * 46 * s, 32 * s, Color.parseColor("#cbd5e1"), Paint.Align.LEFT)
+                  }
+                  text(c, "Tap screen = settings", w / 2, h - 20 * s, 26 * s, Color.parseColor("#64748b"), Paint.Align.CENTER)
+                  postInvalidateDelayed(50)
+              }
+          }
+          EOF_X
+          cat > app/src/main/java/com/bilal/tiktoktug/MainActivity.kt <<'EOF_X'
+          package com.bilal.tiktoktug
+
+          import android.app.Activity
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.*
+          import org.json.JSONObject
+          import kotlin.random.Random
+
+          class MainActivity : Activity() {
+              private lateinit var game: GameView
+              private lateinit var panel: LinearLayout
+              private lateinit var serverEdit: EditText
+              private lateinit var userEdit: EditText
+              private lateinit var net: Net
+              private val handler = Handler(Looper.getMainLooper())
+              private var demoRunning = false
+
+              private val names = listOf("ali", "sara", "ahmed", "zain", "hira", "omar", "maya", "usman")
+              private val demoTick = object : Runnable {
+                  override fun run() {
+                      if (!demoRunning) return
+                      val u = names.random()
+                      val r = Random.nextInt(10)
+                      val e = JSONObject().put("user", u)
+                      when {
+                          r < 2 -> e.put("type", "chat").put("comment", if (Random.nextBoolean()) "1" else "2")
+                          r < 9 -> e.put("type", "like").put("count", Random.nextInt(1, 12))
+                          else -> e.put("type", "gift").put("gift", "Rose").put("diamonds", listOf(1, 5, 30, 100).random())
+                      }
+                      game.handle(e)
+                      handler.postDelayed(this, 300)
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val d = resources.displayMetrics.density
+
+                  game = GameView(this)
+                  net = Net(
+                      onEvent = { ev -> runOnUiThread { game.handle(ev) } },
+                      onStatus = { ok, msg -> runOnUiThread {
+                          game.connected = ok; game.statusText = msg
+                          if (ok) panel.visibility = View.GONE
+                      } }
+                  )
+
+                  fun field(hint: String, value: String): EditText = EditText(this).apply {
+                      setText(value); this.hint = hint
+                      setTextColor(Color.WHITE); setHintTextColor(Color.GRAY)
+                      setBackgroundColor(Color.parseColor("#1e293b"))
+                      setPadding((12 * d).toInt(), (10 * d).toInt(), (12 * d).toInt(), (10 * d).toInt())
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+                      setSingleLine()
+                  }
+                  fun button(label: String, color: String, onClick: () -> Unit) = Button(this).apply {
+                      text = label; setTextColor(Color.WHITE)
+                      setBackgroundColor(Color.parseColor(color))
+                      setOnClickListener { onClick() }
+                  }
+
+                  serverEdit = field("Server: ws://192.168.x.x:8080", prefs.getString("server", "ws://192.168.1.100:8080")!!)
+                  userEdit = field("TikTok username (without @)", prefs.getString("user", "")!!)
+
+                  val connectBtn = button("CONNECT TO TIKTOK LIVE", "#dc2626") {
+                      stopDemo()
+                      prefs.edit().putString("server", serverEdit.text.toString())
+                          .putString("user", userEdit.text.toString()).apply()
+                      game.statusText = "Connecting..."
+                      net.connect(serverEdit.text.toString(), userEdit.text.toString())
+                  }
+                  val demoBtn = button("DEMO MODE (no TikTok)", "#2563eb") {
+                      net.disconnect()
+                      demoRunning = true
+                      game.connected = true; game.statusText = "DEMO mode"
+                      panel.visibility = View.GONE
+                      handler.post(demoTick)
+                  }
+                  val stopBtn = button("STOP", "#475569") {
+                      stopDemo(); net.disconnect()
+                      game.connected = false; game.statusText = "Stopped"
+                  }
+
+                  panel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#E60f172a"))
+                      setPadding((16 * d).toInt(), (16 * d).toInt(), (16 * d).toInt(), (16 * d).toInt())
+                      addView(serverEdit); addView(userEdit)
+                      addView(connectBtn); addView(demoBtn); addView(stopBtn)
+                  }
+
+                  val root = FrameLayout(this)
+                  root.addView(game)
+                  root.addView(panel, FrameLayout.LayoutParams(
+                      FrameLayout.LayoutParams.MATCH_PARENT,
+                      FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+                  game.setOnClickListener {
+                      panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                  }
+                  setContentView(root)
+              }
+
+              private fun stopDemo() { demoRunning = false; handler.removeCallbacks(demoTick) }
+
+              override fun onDestroy() {
+                  stopDemo(); net.disconnect()
+                  super.onDestroy()
+              }
+          }
+          EOF_X
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon
+        working-directory: tt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TikTokTug-APK
+          path: tt/app/build/outputs/apk/debug/app-debug.apk
